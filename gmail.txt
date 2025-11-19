@@ -1,0 +1,184 @@
+/**
+ * This is the main function to run.
+ * It searches Gmail for job alerts from 'alert@indeed.com' from the last 24 hours,
+ * parses the job listings, checks for duplicates against the "Parsed Job Log" sheet,
+ * and appends only new (non-duplicate) jobs to that sheet.
+ */
+function getRecentJobAlerts() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  // 1. Get or create the log sheet for parsed data
+  const sheetName = "Parsed Job Log";
+  let sheet = ss.getSheetByName(sheetName);
+  if (!sheet) {
+    sheet = ss.insertSheet(sheetName);
+    // Set headers *only* if we created a new sheet
+    sheet.appendRow(["Company Name", "Role", "Salary", "Location", "Link"]);
+  }
+
+  // --- NEW DE-DUPLICATION LOGIC ---
+  // 2. Read all existing jobs to prevent duplicates
+  const existingJobKeys = new Set();
+  const lastRow = sheet.getLastRow();
+  
+  if (lastRow > 1) { // Only read if there is data beyond the header row
+    const existingData = sheet.getRange(2, 1, lastRow - 1, 2).getValues();
+    
+    for (const row of existingData) {
+      const company = row[0].toString().toLowerCase().trim();
+      const role = row[1].toString().toLowerCase().trim();
+      if (company && role) {
+        existingJobKeys.add(company + "::" + role); // Create a unique key
+      }
+    }
+  }
+  Logger.log(`Found ${existingJobKeys.size} existing jobs in the sheet.`);
+  // --- END DE-DUPLICATION LOGIC ---
+
+  // 3. Define the search query
+  const query = "from:alert@indeed.com newer_than:1d";
+  
+  // 4. Search Gmail
+  const threads = GmailApp.search(query);
+  
+  // 5. Prepare data for the sheet
+  const newJobsToAdd = []; // This will hold only genuinely new jobs
+  const oneDayAgo = new Date(new Date().getTime() - 24 * 60 * 60 * 1000);
+
+  Logger.log(`Found ${threads.length} email threads matching query.`);
+
+  // 6. Process each thread
+  for (const thread of threads) {
+    const messages = thread.getMessages();
+    
+    for (const message of messages) {
+      if (message.getDate() > oneDayAgo) {
+        
+        const body = message.getPlainBody(); 
+        
+        // --- PARSING LOGIC ---
+        const jobRegex = /^([^\n]+)\n([^\n]+) - ([^\n]+)\n(?:(\$[^\n]+)\n)?([\s\S]*?)^(https:\/\/ca\.indeed\.com\/[^\n]+)/gm;
+        
+        let match;
+        while ((match = jobRegex.exec(body)) !== null) {
+          // Extract data from regex capture groups
+          const role = match[1].trim();
+
+          // --- NEW ROLE TITLE FILTER ---
+          // Check if the role is disqualified based on keywords.
+          // If it is, skip this job and continue the loop.
+          if (isRoleDisqualified(role)) {
+            Logger.log(`Skipping disqualified role: ${role}`);
+            continue; // Stop processing this job and go to the next one
+          }
+          // --- END NEW FILTER ---
+
+          const company = match[2].trim();
+          const location = match[3].trim() || "NA"; // Default to "NA" if empty
+          
+          // --- UPDATED SALARY LOGIC ---
+          const rawSalary = match[4] ? match[4].trim() : null; // Get raw string or null
+          const salary = formatSalary(rawSalary); // Call the new helper function
+          
+          const link = match[6].trim();
+          
+          // --- CHECK FOR DUPLICATES ---
+          const newJobKey = company.toLowerCase().trim() + "::" + role.toLowerCase().trim();
+          
+          if (!existingJobKeys.has(newJobKey)) {
+            // This is a new job!
+            newJobsToAdd.push([company, role, salary, location, link]);
+            
+            // Add it to the set so we don't add it twice in the *same run*
+            existingJobKeys.add(newJobKey); 
+          }
+        }
+      }
+    }
+  }
+  
+  // 7. Write all NEW data to the sheet at once
+  if (newJobsToAdd.length > 0) {
+    const nextRow = sheet.getLastRow() + 1;
+    sheet.getRange(nextRow, 1, newJobsToAdd.length, newJobsToAdd[0].length).setValues(newJobsToAdd);
+    Logger.log(`Successfully added ${newJobsToAdd.length} new jobs to the '${sheetName}' sheet.`);
+  } else {
+    Logger.log("No new (non-duplicate) job alert emails found or parsed in the last 24 hours.");
+  }
+}
+
+/**
+ * NEW HELPER FUNCTION
+ * Checks a job title for disqualifying keywords (e.g., "Intern", "Senior").
+ * @param {string} roleTitle The job title.
+ * @returns {boolean} True if the role should be skipped, false otherwise.
+ */
+function isRoleDisqualified(roleTitle) {
+  // We use a regular expression to find keywords.
+  // \b means "word boundary" so it doesn't match "Senior" inside "Seniority".
+  // i means "case-insensitive".
+  const disqualifyingRegex = /\b(intern|co-op|student|senior|sr\.|lead|principal|architect|manager)\b/i;
+  
+  return disqualifyingRegex.test(roleTitle);
+}
+
+/**
+ * Helper function to parse and format salary strings into a consistent annual format.
+ * @param {string | null} rawSalary The raw salary text from the email (e.g., "$25 - $30 an hour").
+ * @returns {string} A formatted annual salary string (e.g., "$52,000 - $62,400").
+ */
+function formatSalary(rawSalary) {
+  // 1. Handle default case (no salary found)
+  if (!rawSalary) {
+    return "$65,000 - $80,000";
+  }
+
+  // Make a copy of the original to return as fallback
+  const originalSalary = rawSalary; 
+  
+  // 2. Clean string and determine multiplier
+  let multiplier = 1; // Default to annual
+  let cleanedSalary = rawSalary.replace(/[$,]/g, ''); // Remove $ and commas
+
+  if (cleanedSalary.includes('hour')) {
+    multiplier = 2080; // 40 hours/week * 52 weeks/year
+  } else if (cleanedSalary.includes('week')) {
+    multiplier = 52;
+  } else if (cleanedSalary.includes('month')) {
+    multiplier = 12;
+  } else if (cleanedSalary.includes('day')) {
+    multiplier = 260; // 5 days/week * 52 weeks/year
+  }
+
+  // 3. Remove text units to isolate numbers
+  const numberString = cleanedSalary.replace(/ a year| an hour| a week| a month| a day| year| hour| week| month| day/g, '').trim();
+  
+  // 4. Extract numbers
+  const parts = numberString.split(/ - | to /); // Split on " - " or " to "
+  
+  let lowNum = parseFloat(parts[0]);
+  let highNum = lowNum; // Default high to low (for cases like "$40,000 a year")
+  
+  if (parts.length > 1) {
+    highNum = parseFloat(parts[1]);
+  }
+
+  // 5. Check for valid numbers
+  if (isNaN(lowNum)) {
+    return originalSalary; // Unrecognized format, return as-is
+  }
+  if (isNaN(highNum)) {
+    highNum = lowNum; // Safety check if second part was bad
+  }
+
+  // 6. Calculate annual figures
+  const annualLow = Math.round(lowNum * multiplier);
+  const annualHigh = Math.round(highNum * multiplier);
+
+  // 7. Format final string
+  // Use 'en-US' locale for comma formatting
+  const formattedLow = annualLow.toLocaleString('en-US');
+  const formattedHigh = annualHigh.toLocaleString('en-US');
+
+  return `$${formattedLow} - $${formattedHigh}`;
+}
